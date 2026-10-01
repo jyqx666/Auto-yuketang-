@@ -5,8 +5,9 @@
 
 原理：用 Playwright 打开一个真实的 Edge / Chrome 窗口，微信扫码登录后，
 脚本按章节顺序打开还没完成的视频页面，静音并按设定倍速真实播放，
-播完自动进入下一个。观看进度由雨课堂自己的播放器上报，脚本不伪造任何数据，
-也不处理作业、考试、讨论。
+播完自动进入下一个。“继续观看”之类的提示会自动点掉；视频里弹出题目时，
+脚本会暂停并提醒你自己作答。观看进度由雨课堂自己的播放器上报，脚本不伪造任何数据，
+也不替你答题，不处理作业、考试、讨论。
 """
 from __future__ import annotations
 
@@ -41,8 +42,13 @@ DEFAULT_CONFIG = {
     "chapter_wait_seconds": 30,
     "manual_wait_seconds": 300,
     "login_wait_seconds": 300,
+    "quiz_wait_minutes": 30,
     "course_page": "{base_url}/v2/web/studentLog/{classroom_id}",
-    "video_page": "{base_url}/v2/web/xcloud/video-student/{classroom_id}/{leaf_id}",
+    # 按顺序尝试，哪个打开后有视频就一直用哪个（雨课堂新版学习空间用第一个）
+    "video_page": [
+        "{base_url}/ai-workspace/lms-graph/{classroom_id}/video/{leaf_id}",
+        "{base_url}/v2/web/xcloud/video-student/{classroom_id}/{leaf_id}",
+    ],
 }
 
 VIDEO = 0
@@ -82,6 +88,9 @@ def load_config(path: Path) -> dict:
     else:
         log.warning("没找到配置文件 %s，使用默认配置", path)
     cfg["base_url"] = str(cfg["base_url"]).rstrip("/")
+    if isinstance(cfg["video_page"], str):
+        cfg["video_page"] = [cfg["video_page"]]
+    cfg["video_page"] = list(cfg["video_page"])
     return cfg
 
 
@@ -343,7 +352,7 @@ VIDEO_TICK_JS = """
   const videos = Array.from(document.querySelectorAll('video'));
   const v = videos.find(x => x.duration > 0) || videos[0];
   if (!v) return null;
-  if (args.restart) v.currentTime = 0;
+  if (args.reset && v.currentTime > 0) v.currentTime = 0;
   if (args.mute) v.muted = true;
   if (Math.abs(v.playbackRate - args.speed) > 0.01) v.playbackRate = args.speed;
   if (args.play && v.paused && !v.ended) {
@@ -352,6 +361,43 @@ VIDEO_TICK_JS = """
   }
   const dur = isFinite(v.duration) ? v.duration : 0;
   return { cur: v.currentTime, dur: dur, paused: v.paused, ended: v.ended, ready: v.readyState };
+}
+"""
+
+
+# 处理视频页上的弹窗：
+#   - 视频里弹出的题目（可见的“提交/确定”按钮 + 同一容器里 2~12 个选项）只报告，不作答
+#   - “继续观看 / 我知道了”这类单按钮提示直接点掉；从头重播时优先点“从头观看”
+POPUP_JS = """
+(args) => {
+  const vis = e => !!(e && (e.offsetParent || e.getClientRects().length));
+  const txt = e => (e.textContent || '').trim().replace(/\\s+/g, ' ');
+  const buttons = [...document.querySelectorAll('button, [role=button], a.btn, .btn')].filter(vis);
+  const submit = buttons.find(e => /^(提交|提交答案|确定)$/.test(txt(e)));
+  if (submit) {
+    let root = submit;
+    for (let i = 0; i < 10 && root.parentElement; i++) {
+      root = root.parentElement;
+      const options = [...root.querySelectorAll(
+        'li, label, [class*="option" i], [class*="choice" i], [class*="answer" i]')]
+        .filter(e => vis(e) && txt(e) && txt(e).length <= 120 && !e.contains(submit));
+      if (options.length >= 2 && options.length <= 12) return { quiz: true };
+    }
+  }
+  const find = names => {
+    for (const name of names) {
+      const el = buttons.find(e => txt(e) === name);
+      if (el) return el;
+    }
+    return null;
+  };
+  const el = (args.restart && find(['从头观看', '从头播放', '重新观看', '重新播放']))
+    || find(['继续观看', '继续学习', '继续播放', '我知道了', '知道了']);
+  if (el) {
+    el.click();
+    return { clicked: txt(el) };
+  }
+  return null;
 }
 """
 
@@ -503,65 +549,162 @@ async def choose_courses(courses: list[Course], cfg: dict, select_all: bool) -> 
 
 # ---------------------------------------------------------------- 挂机主流程
 
+async def click_tab(page: Page) -> bool:
+    """点“学习内容”之类的标签页，章节目录一般要点开它才会加载。"""
+    for text in ("学习内容", "课程内容", "章节", "目录"):
+        for frame in page.frames:
+            target = frame.get_by_text(text, exact=True)
+            try:
+                if await target.count() == 0:
+                    continue
+                await target.first.click(timeout=3000)
+            except PlaywrightError:
+                continue
+            log.debug("点击了「%s」", text)
+            return True
+    return False
+
+
 async def load_course_page(page: Page, cap: Capture, course: Course, cfg: dict, interactive: bool) -> bool:
     """打开课程页，等网页自己加载章节目录和学习进度。"""
     cap.reset()
     url = cfg["course_page"].format(base_url=cfg["base_url"], classroom_id=course.classroom_id)
     await page.goto(url, wait_until="domcontentloaded")
-    if await wait_for(lambda: cap.chapter is not None, float(cfg["chapter_wait_seconds"])):
-        await wait_for(lambda: cap.schedule is not None, 8)
-        return True
 
-    # 有的课程要先点到“学习内容”之类的标签页才会加载目录
-    for text in ("学习内容", "课程内容", "章节", "目录"):
+    # 课程页默认显示“学习日志”，目录要点到“学习内容”才加载；页面渲染慢时多试几次
+    opened = time.monotonic()
+    deadline = opened + float(cfg["chapter_wait_seconds"])
+    clicked = False
+    next_click = opened + 3
+    while cap.chapter is None and time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        if not clicked and time.monotonic() >= next_click:
+            clicked = await click_tab(page)
+            next_click = time.monotonic() + 5
+
+    if cap.chapter is None and interactive:
+        log.warning("没有自动找到这门课的章节目录。请在浏览器里手动点开这门课、进入能看到视频列表的页面，"
+                    "脚本检测到后会自动继续（最多等 %s 秒，超时跳过这门课）", cfg["manual_wait_seconds"])
+        await wait_for(lambda: cap.chapter is not None, float(cfg["manual_wait_seconds"]))
+    if cap.chapter is None:
+        return False
+    await wait_for(lambda: cap.schedule is not None, 8)
+    return True
+
+
+def alert_user() -> None:
+    if sys.platform == "win32":
+        import winsound
+
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    else:
+        print("\a", end="", flush=True)
+
+
+async def handle_popups(page: Page, restart: bool) -> dict:
+    result: dict = {}
+    for frame in page.frames:
         try:
-            await page.get_by_text(text, exact=True).first.click(timeout=2000)
+            found = await frame.evaluate(POPUP_JS, {"restart": restart})
         except PlaywrightError:
             continue
-        if await wait_for(lambda: cap.chapter is not None, 8):
-            await wait_for(lambda: cap.schedule is not None, 8)
-            return True
+        if found:
+            result.update(found)
+    return result
 
-    if not interactive:
-        return False
-    log.warning("没有自动找到这门课的章节目录。请在浏览器里手动点开这门课、进入能看到视频列表的页面，"
-                "脚本检测到后会自动继续（最多等 %s 秒，超时跳过这门课）", cfg["manual_wait_seconds"])
-    if await wait_for(lambda: cap.chapter is not None, float(cfg["manual_wait_seconds"])):
-        await wait_for(lambda: cap.schedule is not None, 8)
-        return True
+
+async def wait_video(page: Page, cfg: dict, timeout: float) -> dict | None:
+    """等页面上的视频加载出来，页面上没有 <video> 返回 None。"""
+    state = None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = await video_tick(page, {"speed": cfg["speed"], "mute": bool(cfg["mute"]), "play": False, "reset": False})
+        if state and state["dur"] > 0:
+            break
+        await asyncio.sleep(1)
+    return state
+
+
+async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict) -> bool:
+    """按 video_page 里的网址格式依次尝试打开视频页，能用的格式挪到最前面，后面的视频直接用它。"""
+    templates: list[str] = cfg["video_page"]
+    for template in list(templates):
+        url = template.format(base_url=cfg["base_url"], classroom_id=course.classroom_id, leaf_id=leaf.id)
+        cap.watch_progress = []
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+        except PlaywrightError as e:
+            log.debug("打开 %s 失败：%s", url, e)
+            continue
+        if await wait_video(page, cfg, 30) is not None:
+            if template != templates[0]:
+                templates.remove(template)
+                templates.insert(0, template)
+            return True
+        log.debug("%s 上没有视频", url)
     return False
 
 
 async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict, restart: bool) -> bool:
-    url = cfg["video_page"].format(base_url=cfg["base_url"], classroom_id=course.classroom_id, leaf_id=leaf.id)
-    speed, mute = cfg["speed"], bool(cfg["mute"])
-    cap.watch_progress = []
-    await page.goto(url, wait_until="domcontentloaded")
-
-    state = None
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        state = await video_tick(page, {"speed": speed, "mute": mute, "play": False, "restart": False})
-        if state and state["dur"] > 0:
-            break
-        await asyncio.sleep(1)
-    if state is None:
+    if not await open_video(page, cap, course, leaf, cfg):
         log.warning("    页面上没找到视频（可能还没开放，或需要手动操作），跳过")
         return False
     if not restart and cap.video_completed(leaf.id):
         log.info("    这个视频已经看完了，跳过")
         return True
 
+    speed, mute = cfg["speed"], bool(cfg["mute"])
+    quiz_wait = float(cfg["quiz_wait_minutes"]) * 60
     started = time.monotonic()
     last_cur, last_move, last_log = -1.0, started, 0.0
+    prev_cur, prev_tick = None, started
+    quiz_since, last_remind, quiz_total = None, 0.0, 0.0
     reloads = 0
     first = True
     while True:
-        state = await video_tick(page, {"speed": speed, "mute": mute, "play": True, "restart": restart and first})
+        popup = await handle_popups(page, restart)
+        if popup.get("clicked"):
+            log.info("    已自动点掉提示「%s」", popup["clicked"])
+        quiz = bool(popup.get("quiz"))
+        state = await video_tick(page, {"speed": speed, "mute": mute, "play": not quiz, "reset": restart and first})
         first = False
         now = time.monotonic()
+
+        # 视频里弹出了题目：脚本不替你答，暂停等你作答，等待的时间不算卡住
+        if quiz and state and state["paused"]:
+            if quiz_since is None:
+                quiz_since = last_remind = now
+                log.warning("    视频里弹出了题目，请到浏览器窗口里自己作答，答完脚本会自动继续")
+                alert_user()
+                try:
+                    await page.bring_to_front()
+                except PlaywrightError:
+                    pass
+            elif now - last_remind >= 300:
+                last_remind = now
+                log.warning("    还在等你作答视频里的题目……")
+                alert_user()
+            if quiz_wait > 0 and now - quiz_since > quiz_wait:
+                log.warning("    %g 分钟没有作答，先跳过这个视频", float(cfg["quiz_wait_minutes"]))
+                return False
+            last_move = now
+            await asyncio.sleep(3)
+            continue
+        if quiz_since is not None:
+            quiz_total += now - quiz_since
+            quiz_since = None
+            log.info("    题目已作答，继续播放")
+
         if state:
             cur, dur = state["cur"], state["dur"]
+            # 从头重播时，播放器可能自己跳回上次看到的位置，跳了就再拉回开头
+            if (restart and prev_cur is not None and now - started < 120
+                    and cur - prev_cur > (now - prev_tick) * speed + 5):
+                log.info("    播放器跳到了上次看到的位置，拉回开头重新播放")
+                state = await video_tick(page, {"speed": speed, "mute": mute, "play": True, "reset": True}) or state
+                cur = state["cur"]
+            prev_cur, prev_tick = cur, now
+
             if state["ended"] or (dur > 0 and cur >= dur - 0.5):
                 log.info("    播放完成 %s", fmt_time(dur))
                 await asyncio.sleep(8)  # 给播放器留时间把最后的进度上报出去
@@ -573,7 +716,7 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
                 pct = f"{cur / dur * 100:5.1f}%" if dur else "  -  "
                 log.info("    %s / %s  %s  %gx", fmt_time(cur), fmt_time(dur), pct, speed)
             limit = (dur / speed) * 2 + 600 if dur else 3 * 3600
-            if now - started > limit:
+            if now - started - quiz_total > limit:
                 log.warning("    播放时间远超视频时长，放弃这个视频")
                 return False
 
@@ -586,6 +729,7 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
             log.warning("    视频 %s 秒没动了，刷新页面重试（第 %d 次）", STALL_SECONDS, reloads)
             await page.reload(wait_until="domcontentloaded")
             last_cur, last_move = -1.0, time.monotonic()
+            prev_cur = None  # 刷新后播放器会续播到刚才的位置，不算跳转
         await asyncio.sleep(3)
 
 
