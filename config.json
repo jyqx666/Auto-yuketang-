@@ -1,0 +1,10 @@
+{
+  "base_url": "https://www.yuketang.cn",
+  "speed": 2.0,
+  "mute": true,
+  "browser": "msedge",
+  "headless": false,
+  "courses": [],
+  "classroom_ids": [],
+  "max_passes": 2
+}
