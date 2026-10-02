@@ -461,8 +461,9 @@ POPUP_JS = """
 #   - 文字是“2.0X”“2x”“2倍”“×2”这类的元素
 #   - 倍速菜单（class 含 speed / rate）里文字是纯数字的元素
 # 选不超过目标的最高档位；页面上没有倍速菜单返回 null。
+# click 为 false 时只给选项和倍速按钮打上标记（交给 Playwright 用真实鼠标去点），为 true 时用脚本点击。
 SPEED_JS = """
-(target) => {
+({ target, click }) => {
   const ATTRS = ['data-speed', 'keyt', 'cname', 'data-rate'];
   const BOX = 'xt-speedlist, xt-speedbutton, [class*="speed" i], [class*="rate" i], [class*="beisu" i]';
   const own = e => (e.textContent || '').trim().replace(/\\s+/g, '');
@@ -493,6 +494,20 @@ SPEED_JS = """
   if (!usable.length) return { picked: null, available };
   const value = usable[usable.length - 1];
   const best = options.filter(o => o.v === value).sort((a, b) => b.score - a.score)[0].e;
+  const cls = typeof best.className === 'string' ? best.className.trim().split(/\\s+/)[0] : '';
+  const result = { picked: value, available, clicked: `${best.tagName.toLowerCase()}${cls ? '.' + cls : ''} "${own(best)}"` };
+
+  if (!click) {
+    document.querySelectorAll('[data-ykt-speed-option], [data-ykt-speed-hover]').forEach(e => {
+      e.removeAttribute('data-ykt-speed-option');
+      e.removeAttribute('data-ykt-speed-hover');
+    });
+    best.setAttribute('data-ykt-speed-option', '');
+    const button = best.closest('xt-speedbutton') || document.querySelector('xt-speedbutton')
+      || best.parentElement.closest('[class*="speed" i], [class*="rate" i]');
+    if (button) button.setAttribute('data-ykt-speed-hover', '');
+    return result;
+  }
 
   // 先把鼠标“移到”倍速按钮上展开菜单，再完整地模拟一次点击
   const hover = [document.querySelector('xt-speedbutton')];
@@ -507,8 +522,7 @@ SPEED_JS = """
     best.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, button: 0 }));
   }
   best.click();
-  const cls = typeof best.className === 'string' ? best.className.trim().split(/\\s+/)[0] : '';
-  return { picked: value, available, clicked: `${best.tagName.toLowerCase()}${cls ? '.' + cls : ''} "${own(best)}"` };
+  return result;
 }
 """
 
@@ -785,20 +799,30 @@ async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: 
 
 class SpeedControl:
     """
-    让视频按设定倍速播放：优先在播放器自带的倍速菜单里选，没有菜单才直接改 <video> 的倍速。
-    每次检查都看实际倍速，被播放器改回去了就再设一次；一直被改回去说明这门课限制了倍速，就不再强改。
+    让视频按设定倍速播放：
+      - 优先在播放器自带的倍速菜单里选。先用真实的鼠标操作（悬停倍速按钮、再点选项，和手动操作一样），
+        不行再用脚本点击。雨课堂的播放器只有这样选，自己记录的倍速才会变，之后不会被改回去。
+      - 同时直接设置 <video> 的倍速作为兜底。
+      - 视频刚加载的一段时间里，播放器可能会把倍速改回去，所以每次检查都看实际倍速，
+        没生效就一直重试，不会放弃。
     """
 
-    MENU_RETRIES = 2
-    MAX_FIXES = 6
+    MENU_INTERVAL = 6      # 倍速没生效时，隔多少秒重新在菜单里选一次
+    SLOW_AFTER = 120       # 超过这么多秒还没生效，就提示一次，并放慢重试
+    SLOW_INTERVAL = 30
+    CONFIRM_AFTER = 10     # 实际倍速连续保持这么多秒才算生效
 
     def __init__(self, page: Page, wanted: float):
         self.page = page
         self.wanted = wanted
         self.target = wanted
+        self.has_menu = False
         self.direct = False
-        self.fixes = 0
-        self.gave_up = False
+        self.mismatch_since: float | None = None
+        self.last_menu = 0.0
+        self.ok_since: float | None = None
+        self.confirmed = False
+        self.warned = False
 
     async def _eval_frames(self, js: str, arg=None):
         for frame in self.page.frames:
@@ -810,16 +834,45 @@ class SpeedControl:
                 return result
         return None
 
+    async def _select_in_menu(self) -> dict | None:
+        self.last_menu = time.monotonic()
+        for frame in self.page.frames:
+            try:
+                found = await frame.evaluate(SPEED_JS, {"target": self.wanted, "click": False})
+            except PlaywrightError:
+                continue
+            if not found:
+                continue
+            if found.get("picked"):
+                try:
+                    hover = frame.locator("[data-ykt-speed-hover]")
+                    if await hover.count():
+                        await hover.first.hover(timeout=3000, force=True)
+                    await frame.locator("[data-ykt-speed-option]").first.click(timeout=3000, force=True)
+                    found["how"] = "鼠标"
+                except PlaywrightError as e:
+                    log.debug("    用鼠标点倍速菜单失败，改用脚本点击：%s", str(e).splitlines()[0])
+                    try:
+                        await frame.evaluate(SPEED_JS, {"target": self.wanted, "click": True})
+                        found["how"] = "脚本"
+                    except PlaywrightError:
+                        pass
+                try:
+                    await self.page.mouse.move(1, 1)  # 把鼠标移开，让倍速菜单收起来
+                except PlaywrightError:
+                    pass
+            return found
+        return None
+
     async def start(self) -> None:
-        result = await self._eval_frames(SPEED_JS, self.wanted)
-        if result and result.get("picked"):
+        result = await self._select_in_menu()
+        self.has_menu = bool(result and result.get("picked"))
+        if self.has_menu:
             self.target = result["picked"]
             if self.target < self.wanted:
                 log.info("    播放器最高只有 %g 倍速（可选：%s），按 %g 倍播放",
                          self.target, "、".join(f"{v:g}" for v in result["available"]), self.target)
-            else:
-                log.info("    已在播放器的倍速菜单里选择 %g 倍", self.target)
-            log.debug("    点击的倍速选项：%s", result.get("clicked"))
+            log.debug("    在倍速菜单里点了 %s（%s）", result.get("clicked"), result.get("how", "未点击"))
             return
         self.direct = True
         if result:
@@ -831,25 +884,32 @@ class SpeedControl:
 
     def tick_rate(self) -> float | None:
         """需要直接改 <video> 倍速时返回目标倍速，交给 VIDEO_TICK_JS 去设置。"""
-        return self.target if self.direct and not self.gave_up else None
+        return self.target if self.direct else None
 
     async def check(self, actual: float) -> None:
-        if self.gave_up:
-            return
+        now = time.monotonic()
         if abs(actual - self.target) <= 0.01:
-            self.fixes = 0
+            if self.ok_since is None:
+                self.ok_since = now
+            if not self.confirmed and now - self.ok_since >= self.CONFIRM_AFTER:
+                self.confirmed = True
+                log.info("    倍速已生效：%g 倍", self.target)
+            self.mismatch_since = None
             return
-        self.fixes += 1
-        log.debug("    实际倍速 %g，目标 %g（第 %d 次纠正）", actual, self.target, self.fixes)
-        if not self.direct and self.fixes <= self.MENU_RETRIES:
-            # 播放器可能在开始播放时把倍速重置了，在菜单里重新选一次
-            await self._eval_frames(SPEED_JS, self.wanted)
-        elif self.fixes <= self.MAX_FIXES:
-            self.direct = True
-        else:
-            self.gave_up = True
-            log.warning("    播放器一直把倍速改回 %g 倍，按 %g 倍继续播放。如果在播放器里手动选 %g 倍是可以的，"
-                        "请在这个视频里手动选一次，yuketang.log 会记下你点的位置，用来改进脚本", actual, actual, self.wanted)
+        self.ok_since = None
+        if self.mismatch_since is None:
+            self.mismatch_since = now
+        stuck = now - self.mismatch_since
+        log.debug("    实际倍速 %g，目标 %g（已持续 %.0f 秒）", actual, self.target, stuck)
+        self.direct = True
+        interval = self.MENU_INTERVAL if stuck < self.SLOW_AFTER else self.SLOW_INTERVAL
+        if self.has_menu and now - self.last_menu >= interval:
+            result = await self._select_in_menu()
+            log.debug("    重新在倍速菜单里点了 %s（%s）", result and result.get("clicked"), result and result.get("how"))
+        if stuck >= self.SLOW_AFTER and not self.warned:
+            self.warned = True
+            log.warning("    倍速 %d 秒内一直被播放器改回 %g 倍，脚本会继续尝试。如果在播放器里手动选 %g 倍也不行，"
+                        "说明这门课限制了倍速", self.SLOW_AFTER, actual, self.wanted)
             log.debug("    页面上和倍速有关的元素：%s", await self._eval_frames(SPEED_DEBUG_JS))
 
 
