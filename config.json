@@ -6,5 +6,6 @@
   "headless": false,
   "courses": [],
   "classroom_ids": [],
-  "max_passes": 2
+  "max_passes": 2,
+  "quiz_wait_minutes": 30
 }
