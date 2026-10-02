@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 try:
-    from playwright.async_api import BrowserContext, Page, Response, async_playwright
+    from playwright.async_api import BrowserContext, Frame, Page, Response, async_playwright
     from playwright.async_api import Error as PlaywrightError
 except ImportError:
     print("缺少依赖 playwright，请先运行 install.bat（或 pip install -r requirements.txt）")
@@ -346,12 +346,12 @@ KEEP_VISIBLE_JS = """
 })();
 """
 
-# 记录你手动点击过的元素（只记真实的鼠标点击），写进日志，方便排查倍速菜单之类的页面结构
+# 记录你手动点击过的元素（只记真实的鼠标点击，不记脚本自己的点击），写进日志，方便排查倍速菜单之类的页面结构
 CLICK_RECORDER_JS = """
 (() => {
   window.__yktClicks = [];
   document.addEventListener('click', e => {
-    if (!e.isTrusted) return;
+    if (!e.isTrusted || window.__yktBusy) return;
     try {
       const el = e.target;
       const path = [];
@@ -369,21 +369,84 @@ CLICK_RECORDER_JS = """
 })();
 """
 
-# 播放器开始播放、加载或改音量时立刻静音（音量调为 0），
-# 防止播放器按自己记住的音量重新出声；计数上限防止和播放器无限来回
+# 静音保护：播放器每次自己设置静音或音量时，先记下它想要的状态（用来判断播放器自己是不是静音），
+# 然后马上把视频静音、音量调为 0，所以播放器按自己记住的音量恢复声音也不会出声。
+# 脚本自己静音走 window.__yktSilence，不算作播放器的设置。计数上限防止和播放器无限来回。
 MUTE_GUARD_JS = """
 (() => {
-  let fixes = 0;
-  const silence = e => {
-    const m = e.target;
-    if (!(m instanceof HTMLMediaElement) || (m.muted && m.volume === 0) || ++fixes > 500) return;
-    m.muted = true;
-    m.volume = 0;
+  const proto = HTMLMediaElement.prototype;
+  const md = Object.getOwnPropertyDescriptor(proto, 'muted');
+  const vd = Object.getOwnPropertyDescriptor(proto, 'volume');
+  if (!md || !md.set || !vd || !vd.set) return;
+  let own = false, fixes = 0;
+  const silence = (el, fromPage) => {
+    if (md.get.call(el) && vd.get.call(el) === 0) return;
+    if (fromPage && ++fixes > 5000) return;
+    own = true;
+    try { md.set.call(el, true); vd.set.call(el, 0); } finally { own = false; }
   };
+  window.__yktSilence = el => silence(el, false);
+  Object.defineProperty(proto, 'muted', {
+    configurable: true, enumerable: md.enumerable, get: md.get,
+    set(value) {
+      md.set.call(this, value);
+      if (own) return;
+      this.__yktPageMuted = !!value;
+      silence(this, true);
+    },
+  });
+  Object.defineProperty(proto, 'volume', {
+    configurable: true, enumerable: vd.enumerable, get: vd.get,
+    set(value) {
+      vd.set.call(this, value);
+      if (own) return;
+      this.__yktPageVolume = Number(value);
+      silence(this, true);
+    },
+  });
   for (const type of ['loadedmetadata', 'play', 'playing', 'volumechange']) {
-    document.addEventListener(type, silence, true);
+    document.addEventListener(type, e => {
+      if (e.target instanceof HTMLMediaElement) silence(e.target, true);
+    }, true);
   }
 })();
+"""
+
+# 给主视频（显示面积最大的那个）打上标记，用鼠标操作前先把鼠标移到它上面，让自动隐藏的控制栏显示出来
+MARK_VIDEO_JS = """
+() => {
+  document.querySelectorAll('[data-ykt-video]').forEach(e => e.removeAttribute('data-ykt-video'));
+  const area = x => { const r = x.getBoundingClientRect(); return r.width * r.height; };
+  const v = [...document.querySelectorAll('video')].sort((a, b) => area(b) - area(a))[0];
+  if (v) v.setAttribute('data-ykt-video', '');
+  return !!v;
+}
+"""
+
+# 判断播放器自己是不是静音（看它最后一次对主视频的静音、音量设置），并给它的静音按钮打上标记。
+# 雨课堂播放器的静音按钮是 <xt-volumebutton> 里的 <xt-icon>，其余是常见网页播放器的写法。
+MUTE_JS = """
+() => {
+  const area = x => { const r = x.getBoundingClientRect(); return r.width * r.height; };
+  const v = [...document.querySelectorAll('video')].sort((a, b) => area(b) - area(a))[0];
+  if (!v) return null;
+  const pm = v.__yktPageMuted, pv = v.__yktPageVolume;
+  const intent = (pm === true || pv === 0) ? 'muted' : (pm === false || pv > 0) ? 'unmuted' : 'unknown';
+  const selectors = [
+    'xt-volumebutton xt-icon', 'xt-volumebutton', '.xgplayer-volume .xgplayer-icon', '.vjs-mute-control',
+    '[aria-label*="静音"]', '[aria-label*="mute" i]', '[title*="静音"]', '[title*="mute" i]',
+    '[class*="volume" i][class*="icon" i]', '[class*="volume" i][class*="btn" i]', '[class*="volume" i][class*="button" i]',
+  ];
+  let button = null;
+  for (const sel of selectors) {
+    button = document.querySelector(sel);
+    if (button) break;
+  }
+  document.querySelectorAll('[data-ykt-mute]').forEach(e => e.removeAttribute('data-ykt-mute'));
+  if (button) button.setAttribute('data-ykt-mute', '');
+  const cls = button && typeof button.className === 'string' ? button.className.trim().split(/\\s+/)[0] : '';
+  return { intent, button: button ? `${button.tagName.toLowerCase()}${cls ? '.' + cls : ''}` : null };
+}
 """
 
 # 静音页面上所有的音视频；找出主视频（正在显示的面积最大的那个，页面上可能还有隐藏的预加载视频），
@@ -393,8 +456,12 @@ VIDEO_TICK_JS = """
   const media = [...document.querySelectorAll('video, audio')];
   if (args.mute) {
     for (const m of media) {
-      if (!m.muted) m.muted = true;
-      if (m.volume !== 0) m.volume = 0;
+      if (window.__yktSilence) {
+        window.__yktSilence(m);
+      } else {
+        if (!m.muted) m.muted = true;
+        if (m.volume !== 0) m.volume = 0;
+      }
     }
   }
   const area = x => { const r = x.getBoundingClientRect(); return r.width * r.height; };
@@ -461,8 +528,9 @@ POPUP_JS = """
 #   - 文字是“2.0X”“2x”“2倍”“×2”这类的元素
 #   - 倍速菜单（class 含 speed / rate）里文字是纯数字的元素
 # 选不超过目标的最高档位；页面上没有倍速菜单返回 null。
+# click 为 false 时只给选项和倍速按钮打上标记（交给 Playwright 用真实鼠标去点），为 true 时用脚本点击。
 SPEED_JS = """
-(target) => {
+({ target, click }) => {
   const ATTRS = ['data-speed', 'keyt', 'cname', 'data-rate'];
   const BOX = 'xt-speedlist, xt-speedbutton, [class*="speed" i], [class*="rate" i], [class*="beisu" i]';
   const own = e => (e.textContent || '').trim().replace(/\\s+/g, '');
@@ -493,6 +561,20 @@ SPEED_JS = """
   if (!usable.length) return { picked: null, available };
   const value = usable[usable.length - 1];
   const best = options.filter(o => o.v === value).sort((a, b) => b.score - a.score)[0].e;
+  const cls = typeof best.className === 'string' ? best.className.trim().split(/\\s+/)[0] : '';
+  const result = { picked: value, available, clicked: `${best.tagName.toLowerCase()}${cls ? '.' + cls : ''} "${own(best)}"` };
+
+  if (!click) {
+    document.querySelectorAll('[data-ykt-speed-option], [data-ykt-speed-hover]').forEach(e => {
+      e.removeAttribute('data-ykt-speed-option');
+      e.removeAttribute('data-ykt-speed-hover');
+    });
+    best.setAttribute('data-ykt-speed-option', '');
+    const button = best.closest('xt-speedbutton') || document.querySelector('xt-speedbutton')
+      || best.parentElement.closest('[class*="speed" i], [class*="rate" i]');
+    if (button) button.setAttribute('data-ykt-speed-hover', '');
+    return result;
+  }
 
   // 先把鼠标“移到”倍速按钮上展开菜单，再完整地模拟一次点击
   const hover = [document.querySelector('xt-speedbutton')];
@@ -507,8 +589,7 @@ SPEED_JS = """
     best.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, button: 0 }));
   }
   best.click();
-  const cls = typeof best.className === 'string' ? best.className.trim().split(/\\s+/)[0] : '';
-  return { picked: value, available, clicked: `${best.tagName.toLowerCase()}${cls ? '.' + cls : ''} "${own(best)}"` };
+  return result;
 }
 """
 
@@ -783,22 +864,60 @@ async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: 
     return False
 
 
+async def mouse_click(page: Page, frame: Frame, target: str, hover: str | None = None) -> bool:
+    """
+    像手动操作一样用鼠标点击 frame 里的 target（产生真实的鼠标事件）：先把鼠标移到视频上，
+    让自动隐藏的控制栏显示出来，再悬停 hover（比如倍速按钮），点击 target，最后把鼠标移开。
+    """
+    try:
+        await frame.evaluate("() => { window.__yktBusy = true; }")  # 脚本自己的点击不记成你的手动点击
+        if await frame.evaluate(MARK_VIDEO_JS):
+            await frame.locator("[data-ykt-video]").first.hover(timeout=2000, force=True)
+            await asyncio.sleep(0.3)
+        if hover and await frame.locator(hover).count():
+            await frame.locator(hover).first.hover(timeout=3000, force=True)
+        await frame.locator(target).first.click(timeout=3000, force=True)
+        return True
+    except PlaywrightError as e:
+        log.debug("    用鼠标点击 %s 失败：%s", target, str(e).splitlines()[0])
+        return False
+    finally:
+        try:
+            await page.mouse.move(1, 1)  # 把鼠标移开，让菜单收起来
+        except PlaywrightError:
+            pass
+        try:
+            await frame.evaluate("() => { window.__yktBusy = false; }")
+        except PlaywrightError:
+            pass
+
+
 class SpeedControl:
     """
-    让视频按设定倍速播放：优先在播放器自带的倍速菜单里选，没有菜单才直接改 <video> 的倍速。
-    每次检查都看实际倍速，被播放器改回去了就再设一次；一直被改回去说明这门课限制了倍速，就不再强改。
+    让视频按设定倍速播放：
+      - 优先在播放器自带的倍速菜单里选。先用真实的鼠标操作（悬停倍速按钮、再点选项，和手动操作一样），
+        不行再用脚本点击。雨课堂的播放器只有这样选，自己记录的倍速才会变，之后不会被改回去。
+      - 同时直接设置 <video> 的倍速作为兜底。
+      - 视频刚加载的一段时间里，播放器可能会把倍速改回去，所以每次检查都看实际倍速，
+        没生效就一直重试，不会放弃。
     """
 
-    MENU_RETRIES = 2
-    MAX_FIXES = 6
+    MENU_INTERVAL = 6      # 倍速没生效时，隔多少秒重新在菜单里选一次
+    SLOW_AFTER = 120       # 超过这么多秒还没生效，就提示一次，并放慢重试
+    SLOW_INTERVAL = 30
+    CONFIRM_AFTER = 10     # 实际倍速连续保持这么多秒才算生效
 
     def __init__(self, page: Page, wanted: float):
         self.page = page
         self.wanted = wanted
         self.target = wanted
+        self.has_menu = False
         self.direct = False
-        self.fixes = 0
-        self.gave_up = False
+        self.mismatch_since: float | None = None
+        self.last_menu = 0.0
+        self.ok_since: float | None = None
+        self.confirmed = False
+        self.warned = False
 
     async def _eval_frames(self, js: str, arg=None):
         for frame in self.page.frames:
@@ -810,16 +929,36 @@ class SpeedControl:
                 return result
         return None
 
+    async def _select_in_menu(self) -> dict | None:
+        self.last_menu = time.monotonic()
+        for frame in self.page.frames:
+            try:
+                found = await frame.evaluate(SPEED_JS, {"target": self.wanted, "click": False})
+            except PlaywrightError:
+                continue
+            if not found:
+                continue
+            if found.get("picked"):
+                if await mouse_click(self.page, frame, "[data-ykt-speed-option]", hover="[data-ykt-speed-hover]"):
+                    found["how"] = "鼠标"
+                else:
+                    try:
+                        await frame.evaluate(SPEED_JS, {"target": self.wanted, "click": True})
+                        found["how"] = "脚本"
+                    except PlaywrightError:
+                        pass
+            return found
+        return None
+
     async def start(self) -> None:
-        result = await self._eval_frames(SPEED_JS, self.wanted)
-        if result and result.get("picked"):
+        result = await self._select_in_menu()
+        self.has_menu = bool(result and result.get("picked"))
+        if self.has_menu:
             self.target = result["picked"]
             if self.target < self.wanted:
                 log.info("    播放器最高只有 %g 倍速（可选：%s），按 %g 倍播放",
                          self.target, "、".join(f"{v:g}" for v in result["available"]), self.target)
-            else:
-                log.info("    已在播放器的倍速菜单里选择 %g 倍", self.target)
-            log.debug("    点击的倍速选项：%s", result.get("clicked"))
+            log.debug("    在倍速菜单里点了 %s（%s）", result.get("clicked"), result.get("how", "未点击"))
             return
         self.direct = True
         if result:
@@ -831,26 +970,91 @@ class SpeedControl:
 
     def tick_rate(self) -> float | None:
         """需要直接改 <video> 倍速时返回目标倍速，交给 VIDEO_TICK_JS 去设置。"""
-        return self.target if self.direct and not self.gave_up else None
+        return self.target if self.direct else None
 
     async def check(self, actual: float) -> None:
-        if self.gave_up:
-            return
+        now = time.monotonic()
         if abs(actual - self.target) <= 0.01:
-            self.fixes = 0
+            if self.ok_since is None:
+                self.ok_since = now
+            if not self.confirmed and now - self.ok_since >= self.CONFIRM_AFTER:
+                self.confirmed = True
+                log.info("    倍速已生效：%g 倍", self.target)
+            self.mismatch_since = None
             return
-        self.fixes += 1
-        log.debug("    实际倍速 %g，目标 %g（第 %d 次纠正）", actual, self.target, self.fixes)
-        if not self.direct and self.fixes <= self.MENU_RETRIES:
-            # 播放器可能在开始播放时把倍速重置了，在菜单里重新选一次
-            await self._eval_frames(SPEED_JS, self.wanted)
-        elif self.fixes <= self.MAX_FIXES:
-            self.direct = True
-        else:
-            self.gave_up = True
-            log.warning("    播放器一直把倍速改回 %g 倍，按 %g 倍继续播放。如果在播放器里手动选 %g 倍是可以的，"
-                        "请在这个视频里手动选一次，yuketang.log 会记下你点的位置，用来改进脚本", actual, actual, self.wanted)
+        self.ok_since = None
+        if self.mismatch_since is None:
+            self.mismatch_since = now
+        stuck = now - self.mismatch_since
+        log.debug("    实际倍速 %g，目标 %g（已持续 %.0f 秒）", actual, self.target, stuck)
+        self.direct = True
+        interval = self.MENU_INTERVAL if stuck < self.SLOW_AFTER else self.SLOW_INTERVAL
+        if self.has_menu and now - self.last_menu >= interval:
+            result = await self._select_in_menu()
+            log.debug("    重新在倍速菜单里点了 %s（%s）", result and result.get("clicked"), result and result.get("how"))
+        if stuck >= self.SLOW_AFTER and not self.warned:
+            self.warned = True
+            log.warning("    倍速 %d 秒内一直被播放器改回 %g 倍，脚本会继续尝试。如果在播放器里手动选 %g 倍也不行，"
+                        "说明这门课限制了倍速", self.SLOW_AFTER, actual, self.wanted)
             log.debug("    页面上和倍速有关的元素：%s", await self._eval_frames(SPEED_DEBUG_JS))
+
+
+class MuteControl:
+    """
+    像手动操作一样点一下播放器自己的静音按钮，让播放器自己也处于静音（界面上显示静音）。
+    声音本身始终由脚本直接静音保证，这里只管播放器的状态。静音按钮是开关，所以：
+      - 先看播放器自己是不是静音（它最后一次对视频的静音、音量设置），已经是就不点；
+      - 点完核对一次，点反了就再点回来；点了看不出效果就不再点，免得反而把播放器的声音打开。
+    """
+
+    MAX_CLICKS = 4
+    CHECK_INTERVAL = 30
+
+    def __init__(self, page: Page):
+        self.page = page
+        self.clicks = 0
+        self.stopped = False
+        self.next_check = time.monotonic() + 3  # 等视频开始播放、播放器设好自己的音量再看
+
+    async def _find(self) -> tuple[Frame | None, dict | None]:
+        for frame in self.page.frames:
+            try:
+                state = await frame.evaluate(MUTE_JS)
+            except PlaywrightError:
+                continue
+            if state:
+                return frame, state
+        return None, None
+
+    async def ensure(self) -> None:
+        self.next_check = time.monotonic() + self.CHECK_INTERVAL
+        while not self.stopped and self.clicks < self.MAX_CLICKS:
+            frame, state = await self._find()
+            if not state or state["intent"] == "muted":
+                return
+            if not state["button"]:
+                log.debug("    没找到播放器的静音按钮，只直接静音视频")
+                self.stopped = True
+                return
+            before = state["intent"]
+            if not await mouse_click(self.page, frame, "[data-ykt-mute]"):
+                try:
+                    await frame.evaluate("() => { const b = document.querySelector('[data-ykt-mute]'); if (b) b.click(); }")
+                except PlaywrightError:
+                    self.stopped = True
+                    return
+            self.clicks += 1
+            await asyncio.sleep(1)
+            _, state = await self._find()
+            after = state["intent"] if state else None
+            log.debug("    点了播放器的静音按钮 %s：%s → %s", state and state["button"], before, after)
+            if after == "muted":
+                log.info("    已点击播放器的静音按钮")
+                return
+            if after == before:
+                self.stopped = True
+                return
+            # 状态变了但不是静音（播放器原本就是静音，被点成了有声音），回到循环再点一次
 
 
 async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict, restart: bool) -> bool:
@@ -864,6 +1068,7 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
     speed, mute = cfg["speed"], bool(cfg["mute"])
     speed_ctl = SpeedControl(page, speed)
     await speed_ctl.start()
+    mute_ctl = MuteControl(page) if mute else None
     quiz_wait = float(cfg["quiz_wait_minutes"]) * 60
     started = time.monotonic()
     # 第一条进度在开播几秒后再打印，那时倍速已经设好，显示的是实际倍速
@@ -919,6 +1124,8 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
                 cur = state["cur"]
             prev_cur, prev_tick = cur, now
             await speed_ctl.check(state["rate"])
+            if mute_ctl and now >= mute_ctl.next_check and not state["paused"]:
+                await mute_ctl.ensure()
 
             if state["ended"] or (dur > 0 and cur >= dur - 0.5):
                 log.info("    播放完成 %s", fmt_time(dur))
@@ -948,6 +1155,7 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
             if await wait_video(page, cfg, 30) is not None:
                 speed_ctl = SpeedControl(page, speed)
                 await speed_ctl.start()
+                mute_ctl = MuteControl(page) if mute else None
             last_cur, last_move = -1.0, time.monotonic()
             prev_cur = None  # 刷新后播放器会续播到刚才的位置，不算跳转
         await asyncio.sleep(3)
