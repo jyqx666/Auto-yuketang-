@@ -352,15 +352,16 @@ VIDEO_TICK_JS = """
   const videos = Array.from(document.querySelectorAll('video'));
   const v = videos.find(x => x.duration > 0) || videos[0];
   if (!v) return null;
+  const rate = v.playbackRate;
   if (args.reset && v.currentTime > 0) v.currentTime = 0;
   if (args.mute) v.muted = true;
-  if (Math.abs(v.playbackRate - args.speed) > 0.01) v.playbackRate = args.speed;
+  if (args.rate && Math.abs(v.playbackRate - args.rate) > 0.01) v.playbackRate = args.rate;
   if (args.play && v.paused && !v.ended) {
     const p = v.play();
     if (p && p.catch) p.catch(() => {});
   }
   const dur = isFinite(v.duration) ? v.duration : 0;
-  return { cur: v.currentTime, dur: dur, paused: v.paused, ended: v.ended, ready: v.readyState };
+  return { cur: v.currentTime, dur: dur, paused: v.paused, ended: v.ended, ready: v.readyState, rate };
 }
 """
 
@@ -399,6 +400,40 @@ POPUP_JS = """
   }
   return null;
 }
+"""
+
+
+# 在播放器自带的倍速菜单里选倍速（雨课堂播放器是 <xt-speedlist> 里的 <li data-speed="2">）。
+# 通过菜单选，播放器自己记录的倍速和界面显示才会跟着变，不会播一会儿又被改回 1 倍。
+# 选不超过目标的最高档位；页面上没有倍速菜单返回 null。
+SPEED_JS = """
+(target) => {
+  const num = s => { const m = String(s || '').match(/\\d+(?:\\.\\d+)?/); return m ? parseFloat(m[0]) : NaN; };
+  const items = [...new Set(document.querySelectorAll('xt-speedlist li, [class*="speed" i] li, li[data-speed]'))];
+  const options = items
+    .map(e => ({ e, v: num(e.getAttribute('data-speed') || e.getAttribute('keyt') || e.textContent) }))
+    .filter(o => o.v > 0 && o.v <= 16);
+  if (!options.length) return null;
+  const available = [...new Set(options.map(o => o.v))].sort((a, b) => a - b);
+  const usable = options.filter(o => o.v <= target + 1e-6);
+  if (!usable.length) return { picked: null, available };
+  const best = usable.reduce((a, b) => (b.v > a.v ? b : a));
+  const button = document.querySelector('xt-speedbutton') || best.e.closest('[class*="speed" i]');
+  if (button) {
+    for (const type of ['mouseenter', 'mouseover', 'mousemove']) {
+      button.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+    }
+  }
+  best.e.click();
+  return { picked: best.v, available };
+}
+"""
+
+# 找不到倍速菜单时，把页面上和倍速有关的元素记进日志，方便排查
+SPEED_DEBUG_JS = """
+() => [...document.querySelectorAll('[class*="speed" i], [class*="rate" i], xt-speedbutton, xt-speedlist, [data-speed]')]
+  .slice(0, 15)
+  .map(e => `${e.tagName.toLowerCase()}.${String(e.className || '').slice(0, 60)} | ${(e.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60)}`)
 """
 
 
@@ -618,7 +653,7 @@ async def wait_video(page: Page, cfg: dict, timeout: float) -> dict | None:
     state = None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        state = await video_tick(page, {"speed": cfg["speed"], "mute": bool(cfg["mute"]), "play": False, "reset": False})
+        state = await video_tick(page, {"rate": None, "mute": bool(cfg["mute"]), "play": False, "reset": False})
         if state and state["dur"] > 0:
             break
         await asyncio.sleep(1)
@@ -645,6 +680,73 @@ async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: 
     return False
 
 
+class SpeedControl:
+    """
+    让视频按设定倍速播放：优先在播放器自带的倍速菜单里选，没有菜单才直接改 <video> 的倍速。
+    每次检查都看实际倍速，被播放器改回去了就再设一次；一直被改回去说明这门课限制了倍速，就不再强改。
+    """
+
+    MENU_RETRIES = 2
+    MAX_FIXES = 6
+
+    def __init__(self, page: Page, wanted: float):
+        self.page = page
+        self.wanted = wanted
+        self.target = wanted
+        self.direct = False
+        self.fixes = 0
+        self.gave_up = False
+
+    async def _eval_frames(self, js: str, arg=None):
+        for frame in self.page.frames:
+            try:
+                result = await frame.evaluate(js, arg)
+            except PlaywrightError:
+                continue
+            if result:
+                return result
+        return None
+
+    async def start(self) -> None:
+        result = await self._eval_frames(SPEED_JS, self.wanted)
+        if result and result.get("picked"):
+            self.target = result["picked"]
+            if self.target < self.wanted:
+                log.info("    播放器最高只有 %g 倍速（可选：%s），按 %g 倍播放",
+                         self.target, "、".join(f"{v:g}" for v in result["available"]), self.target)
+            else:
+                log.info("    已在播放器的倍速菜单里选择 %g 倍", self.target)
+            return
+        self.direct = True
+        if result:
+            log.info("    播放器的倍速档位里没有 %g 倍（可选：%s），直接设置视频倍速",
+                     self.wanted, "、".join(f"{v:g}" for v in result["available"]))
+        else:
+            log.info("    没找到播放器的倍速菜单，直接设置视频倍速为 %g 倍", self.wanted)
+            log.debug("    页面上和倍速有关的元素：%s", await self._eval_frames(SPEED_DEBUG_JS))
+
+    def tick_rate(self) -> float | None:
+        """需要直接改 <video> 倍速时返回目标倍速，交给 VIDEO_TICK_JS 去设置。"""
+        return self.target if self.direct and not self.gave_up else None
+
+    async def check(self, actual: float) -> None:
+        if self.gave_up:
+            return
+        if abs(actual - self.target) <= 0.01:
+            self.fixes = 0
+            return
+        self.fixes += 1
+        log.debug("    实际倍速 %g，目标 %g（第 %d 次纠正）", actual, self.target, self.fixes)
+        if not self.direct and self.fixes <= self.MENU_RETRIES:
+            # 播放器可能在开始播放时把倍速重置了，在菜单里重新选一次
+            await self._eval_frames(SPEED_JS, self.wanted)
+        elif self.fixes <= self.MAX_FIXES:
+            self.direct = True
+        else:
+            self.gave_up = True
+            log.warning("    播放器一直把倍速改回 %g 倍，这门课可能限制了倍速，按 %g 倍继续播放", actual, actual)
+
+
 async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict, restart: bool) -> bool:
     if not await open_video(page, cap, course, leaf, cfg):
         log.warning("    页面上没找到视频（可能还没开放，或需要手动操作），跳过")
@@ -654,9 +756,12 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
         return True
 
     speed, mute = cfg["speed"], bool(cfg["mute"])
+    speed_ctl = SpeedControl(page, speed)
+    await speed_ctl.start()
     quiz_wait = float(cfg["quiz_wait_minutes"]) * 60
     started = time.monotonic()
-    last_cur, last_move, last_log = -1.0, started, 0.0
+    # 第一条进度在开播几秒后再打印，那时倍速已经设好，显示的是实际倍速
+    last_cur, last_move, last_log = -1.0, started, started - 25
     prev_cur, prev_tick = None, started
     quiz_since, last_remind, quiz_total = None, 0.0, 0.0
     reloads = 0
@@ -666,7 +771,8 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
         if popup.get("clicked"):
             log.info("    已自动点掉提示「%s」", popup["clicked"])
         quiz = bool(popup.get("quiz"))
-        state = await video_tick(page, {"speed": speed, "mute": mute, "play": not quiz, "reset": restart and first})
+        state = await video_tick(page, {"rate": speed_ctl.tick_rate(), "mute": mute, "play": not quiz,
+                                        "reset": restart and first})
         first = False
         now = time.monotonic()
 
@@ -701,9 +807,11 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
             if (restart and prev_cur is not None and now - started < 120
                     and cur - prev_cur > (now - prev_tick) * speed + 5):
                 log.info("    播放器跳到了上次看到的位置，拉回开头重新播放")
-                state = await video_tick(page, {"speed": speed, "mute": mute, "play": True, "reset": True}) or state
+                state = await video_tick(page, {"rate": speed_ctl.tick_rate(), "mute": mute, "play": True,
+                                                "reset": True}) or state
                 cur = state["cur"]
             prev_cur, prev_tick = cur, now
+            await speed_ctl.check(state["rate"])
 
             if state["ended"] or (dur > 0 and cur >= dur - 0.5):
                 log.info("    播放完成 %s", fmt_time(dur))
@@ -714,8 +822,9 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
             if now - last_log >= 30:
                 last_log = now
                 pct = f"{cur / dur * 100:5.1f}%" if dur else "  -  "
-                log.info("    %s / %s  %s  %gx", fmt_time(cur), fmt_time(dur), pct, speed)
-            limit = (dur / speed) * 2 + 600 if dur else 3 * 3600
+                log.info("    %s / %s  %s  %gx", fmt_time(cur), fmt_time(dur), pct, state["rate"])
+            # 按 1 倍速估算上限，倍速没生效时也不会误判
+            limit = dur / min(speed, 1.0) * 1.5 + 600 if dur else 3 * 3600
             if now - started - quiz_total > limit:
                 log.warning("    播放时间远超视频时长，放弃这个视频")
                 return False
@@ -728,6 +837,9 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
                 return False
             log.warning("    视频 %s 秒没动了，刷新页面重试（第 %d 次）", STALL_SECONDS, reloads)
             await page.reload(wait_until="domcontentloaded")
+            if await wait_video(page, cfg, 30) is not None:
+                speed_ctl = SpeedControl(page, speed)
+                await speed_ctl.start()
             last_cur, last_move = -1.0, time.monotonic()
             prev_cur = None  # 刷新后播放器会续播到刚才的位置，不算跳转
         await asyncio.sleep(3)
