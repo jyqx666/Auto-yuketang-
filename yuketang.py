@@ -468,6 +468,26 @@ MARK_VIDEO_JS = """
 }
 """
 
+# 元素现在能不能被鼠标点到：有大小、没被隐藏或透明，而且（need_hit 时）它的中心点没有被别的东西挡住。
+# 返回点不到的原因，方便在日志里看出卡在哪一步
+CLICKABLE_JS = """
+(el, needHit) => {
+  const r = el.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return { ok: false, why: '没有大小（没显示出来）' };
+  if (getComputedStyle(el).visibility === 'hidden') return { ok: false, why: 'visibility: hidden' };
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    if (parseFloat(getComputedStyle(n).opacity) < 0.1) return { ok: false, why: '透明（opacity 接近 0）' };
+  }
+  if (!needHit) return { ok: true, why: '' };
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!hit || !(el === hit || el.contains(hit))) {
+    const cls = hit && typeof hit.className === 'string' ? hit.className.trim().split(/\\s+/)[0] : '';
+    return { ok: false, why: '被挡住，中心点上是 ' + (hit ? hit.tagName.toLowerCase() + (cls ? '.' + cls : '') : '空') };
+  }
+  return { ok: true, why: '' };
+}
+"""
+
 # 判断播放器自己是不是静音（看它最后一次对主视频的静音、音量设置），并给它的静音按钮打上标记。
 # 雨课堂播放器的静音按钮是 <xt-volumebutton> 里的 <xt-icon>，其余是常见网页播放器的写法。
 MUTE_JS = """
@@ -914,19 +934,85 @@ async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: 
     return False
 
 
-async def mouse_click(page: Page, frame: Frame, target: str, hover: str | None = None) -> bool:
+DEBUG_SHOTS: set[str] = set()
+
+
+async def clickable_point(frame: Frame, selector: str, timeout: float,
+                          need_hit: bool = True) -> tuple[tuple[float, float] | None, str]:
     """
-    像手动操作一样用鼠标点击 frame 里的 target（产生真实的鼠标事件）：先把鼠标移到视频上，
-    让自动隐藏的控制栏显示出来，再悬停 hover（比如倍速按钮），点击 target，最后把鼠标移开。
+    等 selector 能被鼠标点到，返回它中心点在页面上的坐标；超时返回 None 和点不到的原因。
+    need_hit 为 False 时只要看得见就行，不管上面有没有盖着别的东西（比如视频上的透明遮罩）。
+    """
+    end = time.monotonic() + timeout
+    why = "页面上没有这个元素"
+    while True:
+        target = frame.locator(selector).first
+        try:
+            if await target.count():
+                state = await target.evaluate(CLICKABLE_JS, need_hit)
+                why = state["why"]
+                if state["ok"]:
+                    box = await target.bounding_box()
+                    if box:
+                        return (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2), ""
+        except PlaywrightError as e:
+            why = str(e).splitlines()[0]
+        if time.monotonic() >= end:
+            return None, why
+        await asyncio.sleep(0.1)
+
+
+async def mouse_click(page: Page, frame: Frame, target: str, hover: str | None = None, shot: str | None = None) -> bool:
+    """
+    像手动操作一样用鼠标点击 frame 里的 target，产生真实的鼠标事件：
+      1. 把鼠标移到视频上，等自动隐藏的控制栏显示出来；
+      2. 有 hover（比如倍速按钮）就移到它上面，等 target（比如 2 倍选项）弹出来；
+         没弹出就在按钮上再动一动，还不行就点一下按钮（有的播放器要点击才弹出菜单）；
+      3. 确认 target 看得见、没被挡住，再移过去按下、松开，最后把鼠标移开。
+    看不见的东西一律不点，免得点空点到视频上把视频暂停。点不成时把卡在哪一步写进日志，
+    shot 给了文件名的话，第一次失败时再截一张图。
     """
     try:
         await frame.evaluate("() => { window.__yktBusy = true; }")  # 脚本自己的点击不记成你的手动点击
         if await frame.evaluate(MARK_VIDEO_JS):
-            await frame.locator("[data-ykt-video]").first.hover(timeout=2000, force=True)
-            await asyncio.sleep(0.3)
-        if hover and await frame.locator(hover).count():
-            await frame.locator(hover).first.hover(timeout=3000, force=True)
-        await frame.locator(target).first.click(timeout=3000, force=True)
+            video, _ = await clickable_point(frame, "[data-ykt-video]", 0, need_hit=False)  # 视频上常盖着透明遮罩
+            if video:
+                await page.mouse.move(video[0], video[1], steps=8)
+                await page.mouse.move(video[0] + 3, video[1] + 3, steps=2)
+        point, why = await clickable_point(frame, hover or target, 3)
+        if not point:
+            why = f"{hover or target} 一直点不到（{why}）"
+        elif hover:
+            for action in ("悬停", "在按钮上移动", "点击按钮"):
+                button, why = await clickable_point(frame, hover, 1)
+                if not button:
+                    point, why = None, f"{hover} 点不到了（{why}）"
+                    break
+                if action == "点击按钮":
+                    await page.mouse.click(*button)
+                else:
+                    offset = 3 if action == "在按钮上移动" else 0
+                    await page.mouse.move(button[0] + offset, button[1] + offset, steps=4)
+                point, why = await clickable_point(frame, target, 1.5)
+                if point:
+                    log.debug("    %s后，%s 弹出来了", action, target)
+                    break
+                why = f"{action}后 {target} 没弹出来（{why}）"
+        if not point:
+            log.debug("    鼠标点击没成功：%s", why)
+            if shot and shot not in DEBUG_SHOTS:
+                DEBUG_SHOTS.add(shot)
+                try:
+                    await page.screenshot(path=str(ROOT / shot))
+                    log.debug("    当时的画面截图保存在 %s", shot)
+                except PlaywrightError:
+                    pass
+            return False
+        await page.mouse.move(*point)  # 直接移过去，免得中途移出菜单让它收起来
+        await asyncio.sleep(0.15)
+        await page.mouse.down()
+        await asyncio.sleep(0.05)
+        await page.mouse.up()
         return True
     except PlaywrightError as e:
         log.debug("    用鼠标点击 %s 失败：%s", target, str(e).splitlines()[0])
@@ -989,7 +1075,8 @@ class SpeedControl:
             if not found:
                 continue
             if found.get("picked"):
-                if await mouse_click(self.page, frame, "[data-ykt-speed-option]", hover="[data-ykt-speed-hover]"):
+                if await mouse_click(self.page, frame, "[data-ykt-speed-option]", hover="[data-ykt-speed-hover]",
+                                     shot="debug_speed.png"):
                     found["how"] = "鼠标"
                 else:
                     try:
