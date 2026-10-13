@@ -15,11 +15,12 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 try:
     from playwright.async_api import BrowserContext, Frame, Page, Response, async_playwright
@@ -31,7 +32,9 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 
 DEFAULT_CONFIG = {
+    "site": "yuketang",
     "base_url": "https://www.yuketang.cn",
+    "xuetangx_url": "https://degreecourse.xuetangx.com/",
     "speed": 2.0,
     "mute": True,
     "browser": "msedge",
@@ -54,6 +57,13 @@ DEFAULT_CONFIG = {
 VIDEO = 0
 LEAF_TYPES = {0: "视频", 3: "图文", 4: "讨论", 5: "考试", 6: "作业"}
 
+# 每个平台各用一份浏览器登录数据和日志文件，两个平台可以同时运行
+SITE_FILES = {
+    "yuketang": ("browser_data", "yuketang.log"),
+    "xuetangx": ("browser_data_xuetangx", "xuetangx.log"),
+}
+LOG_NAME = "yuketang.log"
+
 # 视频多久没有前进就认为卡住了（秒），以及卡住后最多刷新几次
 STALL_SECONDS = 60
 MAX_RELOADS = 3
@@ -63,7 +73,9 @@ log = logging.getLogger("yuketang")
 
 # ---------------------------------------------------------------- 基础工具
 
-def setup_logging(debug: bool) -> None:
+def setup_logging(debug: bool, log_name: str) -> None:
+    global LOG_NAME
+    LOG_NAME = log_name
     try:
         sys.stdout.reconfigure(errors="replace")
     except Exception:
@@ -72,7 +84,7 @@ def setup_logging(debug: bool) -> None:
     console.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
     console.setLevel(logging.DEBUG if debug else logging.INFO)
     # 日志文件总是记录完整信息，出问题时方便排查
-    logfile = logging.FileHandler(ROOT / "yuketang.log", encoding="utf-8")
+    logfile = logging.FileHandler(ROOT / log_name, encoding="utf-8")
     logfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(console)
     log.addHandler(logfile)
@@ -85,8 +97,6 @@ def load_config(path: Path) -> dict:
         # utf-8-sig：兼容用 Windows 记事本保存时带的 BOM
         with path.open(encoding="utf-8-sig") as f:
             cfg.update({k: v for k, v in json.load(f).items() if not k.startswith("_")})
-    else:
-        log.warning("没找到配置文件 %s，使用默认配置", path)
     cfg["base_url"] = str(cfg["base_url"]).rstrip("/")
     if isinstance(cfg["video_page"], str):
         cfg["video_page"] = [cfg["video_page"]]
@@ -278,6 +288,12 @@ def is_done(progress: float | None) -> bool:
     return progress is not None and progress >= 0.999
 
 
+def url_course_key(url: str) -> str:
+    """接口网址参数里的课程（班级）ID，没有返回空字符串。"""
+    query = parse_qs(urlsplit(url).query)
+    return (query.get("cid") or query.get("classroom_id") or [""])[0]
+
+
 # ---------------------------------------------------------------- 抓取网页自己发出的接口数据
 
 class Capture:
@@ -288,18 +304,37 @@ class Capture:
 
     def __init__(self, base_url: str):
         self.host = urlparse(base_url).hostname or ""
-        self.chapter = None
-        self.schedule: dict[str, float] | None = None
-        self.watch_progress: list = []
+        # 见过的每门课（按课程 ID）：章节目录、学习进度、在哪个标签页加载的。reset() 不清空，
+        # 这样脚本忙着处理一门课时，你在浏览器里打开的下一门课也不会丢
+        self.courses: dict[str, dict] = {}
+        self.reset()
 
     def reset(self) -> None:
         self.chapter = None
-        self.schedule = None
-        self.watch_progress = []
+        self.chapter_api: str | None = None    # 章节目录接口的网址（参数里有课程 ID 等）
+        self.chapter_page: Page | None = None  # 是哪个标签页加载的章节目录
+        self.chapter_url: str | None = None    # 当时那个标签页的网址
+        self.schedule: dict[str, float] | None = None
+        self.schedule_url: str | None = None
+        self.watch_progress: list = []
 
     def _is_ours(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
-        return host == self.host or host.endswith(".yuketang.cn")
+        return host == self.host or host.endswith((".yuketang.cn", ".xuetangx.com"))
+
+    def _latest_course_on(self, page: Page | None) -> str | None:
+        """学习进度接口的网址里没有课程 ID 时，算作同一个标签页里最近加载的那门课的。"""
+        same_page = [(info["seen"], key) for key, info in self.courses.items()
+                     if page and "seen" in info and info.get("page") is page]
+        return max(same_page)[1] if same_page else None
+
+    @staticmethod
+    def _page_of(resp: Response) -> tuple[Page | None, str | None]:
+        try:
+            page = resp.frame.page
+            return page, page.url
+        except Exception:
+            return None, None
 
     async def on_response(self, resp: Response) -> None:
         try:
@@ -309,12 +344,22 @@ class Capture:
         except Exception:
             return
         try:
+            page, page_url = self._page_of(resp)
             if find_key(data, "course_chapter") is not None:
                 self.chapter = data
-                log.debug("抓到章节目录：%s", resp.url)
+                self.chapter_api = resp.url
+                self.chapter_page, self.chapter_url = page, page_url
+                key = url_course_key(resp.url) or resp.url
+                self.courses.setdefault(key, {}).update(
+                    chapter=data, api=resp.url, page=page, url=page_url, seen=time.monotonic())
+                log.debug("抓到章节目录：%s（页面 %s）", resp.url, page_url)
             schedule = parse_schedules(data)
             if schedule is not None:
                 self.schedule = schedule
+                self.schedule_url = page_url
+                key = url_course_key(resp.url) or self._latest_course_on(page)
+                if key:  # 学习进度可能比章节目录先到，先存下来
+                    self.courses.setdefault(key, {}).update(schedule=schedule, schedule_url=page_url)
                 log.debug("抓到学习进度：%s", resp.url)
             if "get_video_watch_progress" in resp.url:
                 self.watch_progress.append(data)
@@ -601,8 +646,7 @@ SPEED_DEBUG_JS = """
 """
 
 
-async def launch_browser(pw, cfg: dict) -> BrowserContext:
-    user_dir = ROOT / "browser_data"
+async def launch_browser(pw, cfg: dict, user_dir: Path) -> BrowserContext:
     wanted = cfg["browser"] if cfg["browser"] not in ("", "chromium", None) else None
     # 优先用系统自带的 Edge / Chrome：Playwright 自带的 Chromium 不支持 H.264，播不了大部分课程视频
     channels = [wanted] + [c for c in ("msedge", "chrome") if c != wanted] + [None]
@@ -844,14 +888,20 @@ async def wait_video(page: Page, cfg: dict, timeout: float) -> dict | None:
     return state
 
 
-async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict) -> bool:
-    """按 video_page 里的网址格式依次尝试打开视频页，能用的格式挪到最前面，后面的视频直接用它。"""
-    templates: list[str] = cfg["video_page"]
+async def goto_fresh(page: Page, url: str) -> None:
+    """打开网址。网址带 # 时先跳到空白页，免得单页网站只换了 # 后面的部分、不重新加载页面。"""
+    if "#" in url:
+        await page.goto("about:blank")
+    await page.goto(url, wait_until="domcontentloaded")
+
+
+async def open_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict, templates: list[str]) -> bool:
+    """按 templates 里的网址格式依次尝试打开视频页，能用的格式挪到最前面，后面的视频直接用它。"""
     for template in list(templates):
         url = template.format(base_url=cfg["base_url"], classroom_id=course.classroom_id, leaf_id=leaf.id)
         cap.watch_progress = []
         try:
-            await page.goto(url, wait_until="domcontentloaded")
+            await goto_fresh(page, url)
         except PlaywrightError as e:
             log.debug("打开 %s 失败：%s", url, e)
             continue
@@ -1057,8 +1107,9 @@ class MuteControl:
             # 状态变了但不是静音（播放器原本就是静音，被点成了有声音），回到循环再点一次
 
 
-async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict, restart: bool) -> bool:
-    if not await open_video(page, cap, course, leaf, cfg):
+async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg: dict,
+                      templates: list[str], restart: bool) -> bool:
+    if not await open_video(page, cap, course, leaf, cfg, templates):
         log.warning("    页面上没找到视频（可能还没开放，或需要手动操作），跳过")
         return False
     if not restart and cap.video_completed(leaf.id):
@@ -1162,11 +1213,20 @@ async def watch_video(page: Page, cap: Capture, course: Course, leaf: Leaf, cfg:
 
 
 async def run_course(page: Page, cap: Capture, course: Course, cfg: dict) -> None:
+    """雨课堂：打开课程页拿到章节目录，再挨个播放。"""
     log.info("========== %s ==========", course.name)
     if not await load_course_page(page, cap, course, cfg, interactive=not cfg["headless"]):
         log.warning("拿不到章节目录，跳过这门课（如果它不是慕课类课程，这是正常的）")
         return
+    await play_course(page, cap, course, cfg, cfg["video_page"],
+                      lambda: load_course_page(page, cap, course, cfg, interactive=False))
 
+
+async def play_course(page: Page, cap: Capture, course: Course, cfg: dict, templates: list[str], refresh) -> None:
+    """
+    cap 里已经有这门课的章节目录（和学习进度）。按顺序播放没看完的视频，播完调用 refresh()
+    重新加载学习进度来核对，没算完成的视频下一轮从头播放，最后汇总还剩什么没做。
+    """
     leaves = parse_leaves(cap.chapter)
     videos = [leaf for leaf in leaves if leaf.leaf_type == VIDEO]
     schedule = cap.schedule
@@ -1192,7 +1252,7 @@ async def run_course(page: Page, cap: Capture, course: Course, cfg: dict) -> Non
             log.info("待播放视频 %d 个", len(todo))
         for i, leaf in enumerate(todo, 1):
             log.info("  [%d/%d] %s", i, len(todo), leaf.title)
-            if await watch_video(page, cap, course, leaf, cfg, restart):
+            if await watch_video(page, cap, course, leaf, cfg, templates, restart):
                 watched.add(leaf.id)
                 failed.discard(leaf.id)
             else:
@@ -1200,8 +1260,8 @@ async def run_course(page: Page, cap: Capture, course: Course, cfg: dict) -> Non
 
         if schedule is None:
             break  # 拿不到进度就没法核对，相信播放结束事件
-        # 重新打开课程页刷新学习进度，核对哪些视频还没算完成
-        if await load_course_page(page, cap, course, cfg, interactive=False) and cap.schedule is not None:
+        # 重新加载学习进度，核对哪些视频还没算完成
+        if await refresh() and cap.schedule is not None:
             schedule = cap.schedule
         else:
             log.warning("刷新学习进度失败，无法核对完成情况")
@@ -1225,21 +1285,150 @@ async def run_course(page: Page, cap: Capture, course: Course, cfg: dict) -> Non
         for leaf in others[:30]:
             log.info("  [%s] %s", leaf.type_name, leaf.title)
         if len(others) > 30:
-            log.info("  ……共 %d 项，完整列表见 yuketang.log", len(others))
+            log.info("  ……共 %d 项，完整列表见 %s", len(others), LOG_NAME)
             for leaf in others[30:]:
                 log.debug("  [%s] %s", leaf.type_name, leaf.title)
 
 
+# ---------------------------------------------------------------- 学堂在线（学位课等）
+
+def template_from_url(url: str, ids: set[str]) -> str | None:
+    """网址里出现某个视频的 ID 时，把它换成 {leaf_id}，得到视频页的网址格式。"""
+    for m in re.finditer(r"(?<=[/=#])\d+(?=$|[/?&#])", url):
+        if m.group() in ids:
+            def escape(text: str) -> str:
+                return text.replace("{", "{{").replace("}", "}}")
+            return escape(url[:m.start()]) + "{leaf_id}" + escape(url[m.end():])
+    return None
+
+
+def guess_templates(api_url: str | None, page_url: str | None) -> list[str]:
+    """学不到时，按学堂在线常见的视频页网址格式猜：/learn/{课程签名}/{课程签名}/{班级ID}/video/{视频ID}。"""
+    cid = url_course_key(api_url or "")
+    sign = (parse_qs(urlsplit(api_url or "").query).get("sign") or [""])[0]
+    if not (cid and sign):
+        return []
+    origins = ["https://www.xuetangx.com"]
+    if page_url and page_url.startswith("http"):
+        parts = urlsplit(page_url)
+        origins.insert(0, f"{parts.scheme}://{parts.netloc}")
+    return [f"{origin}/learn/{sign}/{sign}/{cid}/video/{{leaf_id}}" for origin in dict.fromkeys(origins)]
+
+
+async def wait_user(ctx: BrowserContext, cond, timeout: float) -> bool:
+    """等你在浏览器里操作；浏览器窗口被关掉就退出脚本。"""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        if not ctx.pages:
+            raise SystemExit("\n浏览器窗口被关闭，脚本已退出。")
+        await asyncio.sleep(1)
+    return bool(cond())
+
+
+async def learn_video_templates(ctx: BrowserContext, info: dict, ids: set[str]) -> tuple[Page | None, list[str]]:
+    """从标签页的网址学会视频页的网址格式；学不到就请你点开一个视频；还不行就按常见格式猜。"""
+    def found() -> tuple[Page | None, str | None]:
+        for tab in reversed(ctx.pages):  # 新打开的标签页优先
+            template = template_from_url(tab.url, ids)
+            if template:
+                return tab, template
+        return None, None
+
+    tab, template = found()
+    if not template:
+        log.info("请在浏览器里点开这门课的任意一个视频，脚本要从地址栏学会视频页的网址格式（最多等 5 分钟）")
+        await wait_user(ctx, lambda: found()[1] is not None, 300)
+        tab, template = found()
+    guesses = guess_templates(info.get("api"), info.get("url"))
+    if template:
+        log.info("学会了视频页的网址格式：%s", template)
+        return tab, [template] + [g for g in guesses if g != template]
+    log.warning("没学到视频页的网址格式，按学堂在线常见的格式试：%s", "、".join(guesses) or "（没有可猜的）")
+    return None, guesses
+
+
+async def run_xuetangx(ctx: BrowserContext, page: Page, cap: Capture, cfg: dict) -> None:
+    """
+    学堂在线（学位课等）。这个平台的网址结构没法提前写死，所以跟着你的操作来：
+    你登录后在浏览器里打开要刷的课，脚本从网页自己加载的数据里读出章节目录；
+    你点开任意一个视频，脚本从地址栏学会视频页的网址格式，然后自动挨个播放。
+    """
+    finished: set[str] = set()
+
+    def next_course() -> str | None:
+        waiting = [(info["seen"], key) for key, info in cap.courses.items() if "chapter" in info and key not in finished]
+        return max(waiting)[1] if waiting else None  # 有好几门就先处理你最近打开的那门
+
+    await page.goto(cfg["xuetangx_url"], wait_until="domcontentloaded")
+    log.info("请在浏览器里登录学堂在线，打开要刷的课程，并点开其中任意一个视频，脚本检测到后会自动开始")
+    while True:
+        await wait_user(ctx, lambda: next_course() is not None, 7 * 24 * 3600)
+        key = next_course()
+        if key is None:
+            continue
+        info = cap.courses[key]
+        videos = [leaf for leaf in parse_leaves(info["chapter"]) if leaf.leaf_type == VIDEO]
+        tab = info["page"] if info.get("page") and not info["page"].is_closed() else page
+        if not videos:
+            log.warning("这门课的章节目录里没有视频")
+        else:
+            name = find_key(info["chapter"], "course_name")
+            if not name:
+                try:
+                    name = await tab.title()
+                except PlaywrightError:
+                    pass
+            course = Course(key, str(name or "当前课程"))
+            log.info("========== %s ==========", course.name)
+            video_tab, templates = await learn_video_templates(ctx, info, {leaf.id for leaf in videos})
+            work = video_tab or tab
+            refresh_url = info.get("schedule_url") or info.get("url")
+
+            async def refresh() -> bool:
+                info["schedule"] = None
+                if refresh_url:
+                    await goto_fresh(work, refresh_url)
+                    await wait_for(lambda: info.get("schedule") is not None, 30)
+                cap.schedule = info.get("schedule")
+                return cap.schedule is not None
+
+            cap.chapter, cap.schedule = info["chapter"], info.get("schedule")
+            if templates:
+                await play_course(work, cap, course, cfg, templates, refresh)
+                try:
+                    await work.evaluate("() => document.querySelectorAll('video').forEach(v => v.pause())")
+                except PlaywrightError:
+                    pass
+            else:
+                log.warning("不知道怎么打开这门课的视频，跳过。请把 %s 发出来排查", LOG_NAME)
+        finished.add(key)
+        log.info("这门课处理完了。还要刷别的课，就在浏览器里打开那门课并点开一个视频；不刷了直接关掉浏览器窗口")
+
+
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="雨课堂慕课视频自动挂机")
+    parser = argparse.ArgumentParser(description="雨课堂 / 学堂在线视频自动挂机")
+    parser.add_argument("--site", choices=list(SITE_FILES), help="平台：yuketang（雨课堂）或 xuetangx（学堂在线），默认看配置文件")
     parser.add_argument("--config", default=str(ROOT / "config.json"), help="配置文件路径")
     parser.add_argument("--speed", type=float, help="播放倍速，覆盖配置文件")
     parser.add_argument("--all", action="store_true", help="刷全部课程，不询问")
     parser.add_argument("--debug", action="store_true", help="输出调试日志")
     args = parser.parse_args()
 
-    setup_logging(args.debug)
     cfg = load_config(Path(args.config))
+    site = args.site or str(cfg["site"])
+    if site not in SITE_FILES:
+        raise SystemExit(f"config.json 里的 site 只能是 {' 或 '.join(SITE_FILES)}，现在是 {site}")
+    profile, log_name = SITE_FILES[site]
+    setup_logging(args.debug, log_name)
+    if not Path(args.config).exists():
+        log.warning("没找到配置文件 %s，使用默认配置", args.config)
+    if site == "xuetangx":
+        cfg["base_url"] = str(cfg["xuetangx_url"]).rstrip("/")
+        if cfg["headless"]:
+            log.warning("学堂在线需要你在浏览器里登录、打开课程，忽略 headless 设置")
+            cfg["headless"] = False
     if args.speed:
         cfg["speed"] = args.speed
     cfg["speed"] = clamp_speed(float(cfg["speed"]))
@@ -1247,7 +1436,7 @@ async def main() -> None:
     keep_awake(True)
     try:
         async with async_playwright() as pw:
-            ctx = await launch_browser(pw, cfg)
+            ctx = await launch_browser(pw, cfg, ROOT / profile)
             cap = Capture(cfg["base_url"])
             ctx.on("response", cap.on_response)
             await ctx.add_init_script(KEEP_VISIBLE_JS)
@@ -1256,6 +1445,10 @@ async def main() -> None:
                 await ctx.add_init_script(MUTE_GUARD_JS)
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             try:
+                if site == "xuetangx":
+                    log.info("学堂在线，倍速 %gx。开始播放后浏览器窗口可以最小化，但不要关闭。", cfg["speed"])
+                    await run_xuetangx(ctx, page, cap, cfg)
+                    return
                 courses = await login(ctx, page, cfg)
                 selected = await choose_courses(courses, cfg, args.all)
                 if not selected:
