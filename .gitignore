@@ -1,5 +1,6 @@
 browser_data*/
 *.log
 login_qrcode.png
+debug_*.png
 __pycache__/
 *.pyc
